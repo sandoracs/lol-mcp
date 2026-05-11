@@ -180,6 +180,21 @@ async def on_ready():
     log.info("Serving %d guild(s)", len(bot.guilds))
     for guild in bot.guilds:
         log.info("  - %s (id=%s)", guild.name, guild.id)
+    log.info("Message Content Intent enabled: %s", bot.intents.message_content)
+    log.info("Command prefix: %s", bot.command_prefix)
+
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    log.debug(
+        "Message received in #%s from %s: %s",
+        message.channel,
+        message.author,
+        message.content[:100],
+    )
+    await bot.process_commands(message)
 
 
 @bot.event
