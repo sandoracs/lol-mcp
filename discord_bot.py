@@ -3,10 +3,12 @@
 
 Commands:
   !setid <Name#Tag>       — Save your Riot ID (do this once)
-  !coach <question>       — Ask the AI coach anything (uses your saved Riot ID)
+  !coach <question>       — Start or continue a coaching conversation
+  !reset                  — Clear conversation history and start fresh
   !stats [Name#Tag]       — Quick ranked stats embed
   !match [Name#Tag]       — Analyse most recent match
   !profile [Name#Tag]     — Summoner profile
+  !help                   — Show this help
 """
 
 import asyncio
@@ -14,6 +16,7 @@ import json
 import logging
 import os
 import sys
+import time
 
 import anthropic
 import discord
@@ -86,6 +89,37 @@ def load_riot_id(discord_id: str) -> str | None:
 def resolve_riot_id(discord_id: str, provided: str | None) -> str | None:
     """Return provided Riot ID if given, otherwise fall back to saved one."""
     return provided or load_riot_id(discord_id)
+
+
+# ---------------------------------------------------------------------------
+# Per-user conversation history (in-memory, keyed by channel+user)
+# ---------------------------------------------------------------------------
+
+CONVERSATION_TIMEOUT = 30 * 60  # 30 minutes of inactivity clears history
+_histories: dict[tuple[int, int], dict] = {}
+
+
+def get_history(channel_id: int, user_id: int) -> list:
+    entry = _histories.get((channel_id, user_id))
+    if entry and time.time() - entry["last_active"] < CONVERSATION_TIMEOUT:
+        return list(entry["messages"])
+    return []
+
+
+def save_history(channel_id: int, user_id: int, messages: list):
+    _histories[(channel_id, user_id)] = {
+        "messages": messages,
+        "last_active": time.time(),
+    }
+
+
+def clear_history(channel_id: int, user_id: int):
+    _histories.pop((channel_id, user_id), None)
+
+
+def has_active_conversation(channel_id: int, user_id: int) -> bool:
+    entry = _histories.get((channel_id, user_id))
+    return bool(entry and time.time() - entry["last_active"] < CONVERSATION_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Tool specs mirroring the MCP server (used by the agentic !coach command)
@@ -225,13 +259,24 @@ async def on_ready():
 async def on_message(message):
     if message.author == bot.user:
         return
+
     log.debug(
-        "Message received in #%s from %s: %s",
+        "Message in #%s from %s: %s",
         message.channel,
         message.author,
         message.content[:100],
     )
-    await bot.process_commands(message)
+
+    # If it's a command, handle normally
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+
+    # If the user has an active coach conversation, treat the message as a follow-up
+    if has_active_conversation(message.channel.id, message.author.id):
+        ctx = await bot.get_context(message)
+        async with message.channel.typing():
+            await run_coach(ctx, message.content)
 
 
 @bot.event
@@ -299,6 +344,16 @@ async def help_cmd(ctx):
         inline=False,
     )
 
+    embed.add_field(
+        name="Conversation",
+        value=(
+            "After `!coach`, just reply naturally — no need to type `!coach` again.\n"
+            "The bot remembers the last 30 minutes of chat.\n"
+            "`!reset` — clear history and start fresh."
+        ),
+        inline=False,
+    )
+
     embed.set_footer(text="Riot ID is optional in [ ] commands if you've used !setid")
     await ctx.send(embed=embed)
 
@@ -314,16 +369,15 @@ async def setid_cmd(ctx, riot_id: str):
     await ctx.send(f"Got it! I'll remember your Riot ID as **{riot_id}**. You can now use `!coach`, `!stats`, `!match` without specifying it.")
 
 
-@bot.command(name="coach")
-async def coach_cmd(ctx, *, query: str):
-    """Agentic coaching: Claude picks which tools to call."""
+async def run_coach(ctx, query: str):
+    """Core agentic loop — shared by !coach and plain follow-up messages."""
     riot_id = load_riot_id(str(ctx.author.id))
-    log.info("!coach from %s (riot_id=%s): %s", ctx.author, riot_id, query)
-    await ctx.send("*Fetching data and analysing...*")
+    log.info("Coach query from %s (riot_id=%s): %s", ctx.author, riot_id, query)
 
-    messages = [{"role": "user", "content": query}]
+    messages = get_history(ctx.channel.id, ctx.author.id)
+    messages.append({"role": "user", "content": query})
 
-    for iteration in range(10):  # safety cap on agentic iterations
+    for iteration in range(10):
         log.debug("Claude iteration %d", iteration + 1)
         response = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -341,7 +395,9 @@ async def coach_cmd(ctx, *, query: str):
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), "No response."
             )
-            log.info("!coach response sent (%d chars)", len(text))
+            messages.append({"role": "assistant", "content": text})
+            save_history(ctx.channel.id, ctx.author.id, messages)
+            log.info("Coach response sent (%d chars, history=%d msgs)", len(text), len(messages))
             await _send_long(ctx, text)
             return
 
@@ -365,8 +421,23 @@ async def coach_cmd(ctx, *, query: str):
             await ctx.send("Unexpected stop reason — please try again.")
             return
 
-    log.warning("!coach hit iteration limit for %s", ctx.author)
+    log.warning("Coach hit iteration limit for %s", ctx.author)
     await ctx.send("Reached iteration limit. Please try a more specific query.")
+
+
+@bot.command(name="coach")
+async def coach_cmd(ctx, *, query: str):
+    """Start or continue a coaching conversation."""
+    await ctx.send("*Thinking...*")
+    await run_coach(ctx, query)
+
+
+@bot.command(name="reset")
+async def reset_cmd(ctx):
+    """Clear your conversation history and start fresh."""
+    clear_history(ctx.channel.id, ctx.author.id)
+    log.info("Conversation cleared for %s", ctx.author)
+    await ctx.send("Conversation cleared. Start fresh with `!coach <question>`.")
 
 
 @bot.command(name="stats")
