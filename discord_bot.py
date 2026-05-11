@@ -10,7 +10,9 @@ Commands:
 
 import asyncio
 import json
+import logging
 import os
+import sys
 
 import anthropic
 import discord
@@ -22,14 +24,35 @@ from config import Config
 from riot_api import RiotAPIClient
 
 # ---------------------------------------------------------------------------
+# Logging — set VERBOSE=1 in .env or environment for debug output
+# ---------------------------------------------------------------------------
+
+VERBOSE = os.getenv("VERBOSE", "0") == "1"
+
+logging.basicConfig(
+    level=logging.DEBUG if VERBOSE else logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("lol-bot")
+
+# Suppress noisy discord.py internals unless in verbose mode
+if not VERBOSE:
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("discord.http").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
 # Bootstrap shared components
 # ---------------------------------------------------------------------------
 
+log.info("Starting LoL Coach Bot...")
 config = Config()
 cache = CacheManager(config.cache_db_path)
 riot = RiotAPIClient(config.riot_api_key, cache, config)
 analyzer = LoLAnalyzer(config.anthropic_api_key)
 anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+log.info("Components initialised (region=%s, routing=%s)", config.region, config.regional_routing)
 
 # ---------------------------------------------------------------------------
 # Tool specs mirroring the MCP server (used by the agentic !coach command)
@@ -95,6 +118,7 @@ TOOLS = [
 
 
 async def execute_tool(name: str, args: dict) -> str:
+    log.debug("Tool call: %s(%s)", name, args)
     try:
         if name == "get_summoner":
             r = await riot.get_summoner(args["riot_id"])
@@ -115,13 +139,17 @@ async def execute_tool(name: str, args: dict) -> str:
                 ranked,
                 args.get("focus_area", "overall"),
             )
+            log.debug("Tool %s completed", name)
             return r if isinstance(r, str) else json.dumps(r, indent=2)
         elif name == "get_champion_stats":
             r = await riot.get_champion_stats(args["riot_id"], count=args.get("count", 20))
         else:
+            log.warning("Unknown tool requested: %s", name)
             return f"Unknown tool: {name}"
+        log.debug("Tool %s completed", name)
         return json.dumps(r, indent=2, ensure_ascii=False)
     except Exception as exc:
+        log.error("Tool %s failed: %s", name, exc, exc_info=VERBOSE)
         return f"Error: {exc}"
 
 
@@ -148,17 +176,46 @@ async def _send_long(ctx, text: str):
 
 @bot.event
 async def on_ready():
-    print(f"LoL Coach Bot online as {bot.user} (id={bot.user.id})")
+    log.info("LoL Coach Bot online as %s (id=%s)", bot.user, bot.user.id)
+    log.info("Serving %d guild(s)", len(bot.guilds))
+    for guild in bot.guilds:
+        log.info("  - %s (id=%s)", guild.name, guild.id)
+
+
+@bot.event
+async def on_command(ctx):
+    log.info(
+        "Command received: !%s from %s#%s in #%s",
+        ctx.command,
+        ctx.author.name,
+        ctx.author.discriminator,
+        ctx.channel,
+    )
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        log.debug("Unknown command: %s", ctx.message.content)
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing argument: `{error.param.name}`. Check `!help` for usage.")
+        log.warning("Missing argument in command from %s: %s", ctx.author, error)
+        return
+    log.error("Unhandled command error: %s", error, exc_info=VERBOSE)
+    await ctx.send(f"Error: {error}")
 
 
 @bot.command(name="coach")
 async def coach_cmd(ctx, *, query: str):
     """Agentic coaching: Claude picks which tools to call."""
+    log.info("!coach from %s: %s", ctx.author, query)
     await ctx.send("*Fetching data and analysing...*")
 
     messages = [{"role": "user", "content": query}]
 
-    for _ in range(10):  # safety cap on agentic iterations
+    for iteration in range(10):  # safety cap on agentic iterations
+        log.debug("Claude iteration %d", iteration + 1)
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: anthropic_client.messages.create(
@@ -169,11 +226,13 @@ async def coach_cmd(ctx, *, query: str):
                 messages=messages,
             ),
         )
+        log.debug("Claude stop_reason=%s", response.stop_reason)
 
         if response.stop_reason == "end_turn":
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), "No response."
             )
+            log.info("!coach response sent (%d chars)", len(text))
             await _send_long(ctx, text)
             return
 
@@ -182,6 +241,7 @@ async def coach_cmd(ctx, *, query: str):
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    log.info("Claude calling tool: %s(%s)", block.name, block.input)
                     result = await execute_tool(block.name, block.input)
                     tool_results.append(
                         {
@@ -192,15 +252,18 @@ async def coach_cmd(ctx, *, query: str):
                     )
             messages.append({"role": "user", "content": tool_results})
         else:
+            log.warning("Unexpected stop_reason: %s", response.stop_reason)
             await ctx.send("Unexpected stop reason — please try again.")
             return
 
+    log.warning("!coach hit iteration limit for %s", ctx.author)
     await ctx.send("Reached iteration limit. Please try a more specific query.")
 
 
 @bot.command(name="stats")
 async def stats_cmd(ctx, riot_id: str):
     """Show ranked stats as a Discord embed."""
+    log.info("!stats from %s for %s", ctx.author, riot_id)
     try:
         data = await riot.get_ranked_stats(riot_id)
         embed = discord.Embed(
@@ -229,39 +292,49 @@ async def stats_cmd(ctx, riot_id: str):
             embed.description = "Unranked this season."
 
         await ctx.send(embed=embed)
+        log.info("!stats response sent for %s", riot_id)
     except Exception as exc:
+        log.error("!stats failed for %s: %s", riot_id, exc, exc_info=VERBOSE)
         await ctx.send(f"Error: {exc}")
 
 
 @bot.command(name="match")
 async def match_cmd(ctx, riot_id: str):
     """Analyse the player's most recent match."""
+    log.info("!match from %s for %s", ctx.author, riot_id)
     try:
         await ctx.send("*Fetching last match...*")
         history = await riot.get_match_history(riot_id, count=1)
         match_ids = history.get("match_ids", [])
         if not match_ids:
+            log.warning("No matches found for %s", riot_id)
             await ctx.send("No recent matches found.")
             return
+        log.debug("Fetching match details for %s", match_ids[0])
         match_data = await riot.get_match_details(match_ids[0], riot_id)
         analysis = await asyncio.get_event_loop().run_in_executor(
             None, analyzer.analyze_match, riot_id, match_data
         )
         await _send_long(ctx, f"**Match analysis for {riot_id}**\n\n{analysis}")
+        log.info("!match response sent for %s", riot_id)
     except Exception as exc:
+        log.error("!match failed for %s: %s", riot_id, exc, exc_info=VERBOSE)
         await ctx.send(f"Error: {exc}")
 
 
 @bot.command(name="profile")
 async def profile_cmd(ctx, riot_id: str):
     """Show summoner profile."""
+    log.info("!profile from %s for %s", ctx.author, riot_id)
     try:
         p = await riot.get_summoner(riot_id)
         embed = discord.Embed(title=riot_id, color=0xC89B3C)
         embed.add_field(name="Level", value=str(p.get("summoner_level", "?")))
         embed.add_field(name="Tag", value=p.get("tag_line", "?"))
         await ctx.send(embed=embed)
+        log.info("!profile response sent for %s", riot_id)
     except Exception as exc:
+        log.error("!profile failed for %s: %s", riot_id, exc, exc_info=VERBOSE)
         await ctx.send(f"Error: {exc}")
 
 
@@ -269,4 +342,5 @@ if __name__ == "__main__":
     token = config.discord_token
     if not token:
         raise SystemExit("DISCORD_TOKEN is not set in .env")
-    bot.run(token)
+    log.info("Verbose mode: %s", VERBOSE)
+    bot.run(token, log_handler=None)  # logging already configured above
