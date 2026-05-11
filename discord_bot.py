@@ -192,7 +192,7 @@ async def execute_tool(name: str, args: dict) -> str:
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 def coach_system(riot_id: str | None) -> str:
     base = (
@@ -256,6 +256,51 @@ async def on_command_error(ctx, error):
         return
     log.error("Unhandled command error: %s", error, exc_info=VERBOSE)
     await ctx.send(f"Error: {error}")
+
+
+@bot.command(name="help", aliases=["h"])
+async def help_cmd(ctx):
+    """Show all commands and example coach questions."""
+    embed = discord.Embed(
+        title="LoL Agentic Coach — Help",
+        color=0xC89B3C,
+    )
+
+    embed.add_field(
+        name="Setup",
+        value=(
+            "`!setid Name#Tag` — Save your Riot ID once so you never type it again"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Quick Commands",
+        value=(
+            "`!stats [Name#Tag]` — Ranked stats (Solo/Duo & Flex)\n"
+            "`!match [Name#Tag]` — AI review of your most recent game\n"
+            "`!profile [Name#Tag]` — Summoner level & info"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Coach — example questions",
+        value=(
+            "`!coach how was my last game?`\n"
+            "`!coach what should I improve?`\n"
+            "`!coach analyze my last 10 games`\n"
+            "`!coach what are my best champions?`\n"
+            "`!coach my CS is bad, help me improve`\n"
+            "`!coach I keep dying too much, why?`\n"
+            "`!coach give me tips for Zed into Yasuo mid`\n"
+            "`!coach how is Faker#KR1 doing?`"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Riot ID is optional in [ ] commands if you've used !setid")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="setid")
