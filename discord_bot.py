@@ -2,10 +2,11 @@
 """Discord bot interface for the LoL MCP coach.
 
 Commands:
-  !coach <question>       — Ask the AI coach anything (agentic, uses Riot tools)
-  !stats <Name#Tag>       — Quick ranked stats embed
-  !match <Name#Tag>       — Analyse most recent match
-  !profile <Name#Tag>     — Summoner profile
+  !setid <Name#Tag>       — Save your Riot ID (do this once)
+  !coach <question>       — Ask the AI coach anything (uses your saved Riot ID)
+  !stats [Name#Tag]       — Quick ranked stats embed
+  !match [Name#Tag]       — Analyse most recent match
+  !profile [Name#Tag]     — Summoner profile
 """
 
 import asyncio
@@ -53,6 +54,38 @@ riot = RiotAPIClient(config.riot_api_key, cache, config)
 analyzer = LoLAnalyzer(config.anthropic_api_key)
 anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
 log.info("Components initialised (region=%s, routing=%s)", config.region, config.regional_routing)
+
+# ---------------------------------------------------------------------------
+# Per-user Riot ID storage (persisted in the same SQLite DB)
+# ---------------------------------------------------------------------------
+
+cache._conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_profiles (
+        discord_id TEXT PRIMARY KEY,
+        riot_id TEXT NOT NULL
+    )
+""")
+cache._conn.commit()
+
+
+def save_riot_id(discord_id: str, riot_id: str):
+    cache._conn.execute(
+        "INSERT OR REPLACE INTO user_profiles (discord_id, riot_id) VALUES (?, ?)",
+        (discord_id, riot_id),
+    )
+    cache._conn.commit()
+
+
+def load_riot_id(discord_id: str) -> str | None:
+    row = cache._conn.execute(
+        "SELECT riot_id FROM user_profiles WHERE discord_id = ?", (discord_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def resolve_riot_id(discord_id: str, provided: str | None) -> str | None:
+    """Return provided Riot ID if given, otherwise fall back to saved one."""
+    return provided or load_riot_id(discord_id)
 
 # ---------------------------------------------------------------------------
 # Tool specs mirroring the MCP server (used by the agentic !coach command)
@@ -161,11 +194,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-COACH_SYSTEM = (
-    "You are an expert League of Legends coach. "
-    "Use the available tools to fetch real player data and give specific, "
-    "data-backed coaching advice. Always reference actual numbers."
-)
+def coach_system(riot_id: str | None) -> str:
+    base = (
+        "You are an expert League of Legends coach. "
+        "Use the available tools to fetch real player data and give specific, "
+        "data-backed coaching advice. Always reference actual numbers."
+    )
+    if riot_id:
+        base += f" The user's Riot ID is {riot_id} — use it automatically when fetching data unless they ask about someone else."
+    return base
 
 
 async def _send_long(ctx, text: str):
@@ -221,10 +258,22 @@ async def on_command_error(ctx, error):
     await ctx.send(f"Error: {error}")
 
 
+@bot.command(name="setid")
+async def setid_cmd(ctx, riot_id: str):
+    """Save your Riot ID so you don't have to type it every time."""
+    if "#" not in riot_id:
+        await ctx.send("Please use the format `Name#Tag` (e.g. `!setid Faker#KR1`)")
+        return
+    save_riot_id(str(ctx.author.id), riot_id)
+    log.info("Saved Riot ID for %s: %s", ctx.author, riot_id)
+    await ctx.send(f"Got it! I'll remember your Riot ID as **{riot_id}**. You can now use `!coach`, `!stats`, `!match` without specifying it.")
+
+
 @bot.command(name="coach")
 async def coach_cmd(ctx, *, query: str):
     """Agentic coaching: Claude picks which tools to call."""
-    log.info("!coach from %s: %s", ctx.author, query)
+    riot_id = load_riot_id(str(ctx.author.id))
+    log.info("!coach from %s (riot_id=%s): %s", ctx.author, riot_id, query)
     await ctx.send("*Fetching data and analysing...*")
 
     messages = [{"role": "user", "content": query}]
@@ -236,7 +285,7 @@ async def coach_cmd(ctx, *, query: str):
             lambda: anthropic_client.messages.create(
                 model="claude-opus-4-7",
                 max_tokens=4096,
-                system=COACH_SYSTEM,
+                system=coach_system(riot_id),
                 tools=TOOLS,
                 messages=messages,
             ),
@@ -276,8 +325,12 @@ async def coach_cmd(ctx, *, query: str):
 
 
 @bot.command(name="stats")
-async def stats_cmd(ctx, riot_id: str):
+async def stats_cmd(ctx, riot_id: str = None):
     """Show ranked stats as a Discord embed."""
+    riot_id = resolve_riot_id(str(ctx.author.id), riot_id)
+    if not riot_id:
+        await ctx.send("I don't know your Riot ID yet. Use `!setid Name#Tag` to save it, or pass it directly: `!stats Name#Tag`")
+        return
     log.info("!stats from %s for %s", ctx.author, riot_id)
     try:
         data = await riot.get_ranked_stats(riot_id)
@@ -314,8 +367,12 @@ async def stats_cmd(ctx, riot_id: str):
 
 
 @bot.command(name="match")
-async def match_cmd(ctx, riot_id: str):
+async def match_cmd(ctx, riot_id: str = None):
     """Analyse the player's most recent match."""
+    riot_id = resolve_riot_id(str(ctx.author.id), riot_id)
+    if not riot_id:
+        await ctx.send("I don't know your Riot ID yet. Use `!setid Name#Tag` to save it, or pass it directly: `!match Name#Tag`")
+        return
     log.info("!match from %s for %s", ctx.author, riot_id)
     try:
         await ctx.send("*Fetching last match...*")
@@ -338,8 +395,12 @@ async def match_cmd(ctx, riot_id: str):
 
 
 @bot.command(name="profile")
-async def profile_cmd(ctx, riot_id: str):
+async def profile_cmd(ctx, riot_id: str = None):
     """Show summoner profile."""
+    riot_id = resolve_riot_id(str(ctx.author.id), riot_id)
+    if not riot_id:
+        await ctx.send("I don't know your Riot ID yet. Use `!setid Name#Tag` to save it, or pass it directly: `!profile Name#Tag`")
+        return
     log.info("!profile from %s for %s", ctx.author, riot_id)
     try:
         p = await riot.get_summoner(riot_id)
