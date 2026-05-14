@@ -13,9 +13,9 @@ rather than generic platitudes. Prioritize the highest-impact improvements first
 
 
 class LoLAnalyzer:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str = "claude-opus-4-7"):
         self.client = anthropic.Anthropic(api_key=api_key)
-        self.model = "claude-opus-4-7"
+        self.model = model
 
     def _chat(self, user_content: str, max_tokens: int = 2048) -> str:
         response = self.client.messages.create(

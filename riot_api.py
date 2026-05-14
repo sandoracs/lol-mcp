@@ -146,7 +146,7 @@ class RiotAPIClient:
             f"/lol/match/v5/matches/by-puuid/{puuid}/ids?{params}"
         )
         data = await self._get(url)
-        self.cache.set(cache_key, data, 300)  # 5 min — list changes as new games finish
+        self.cache.set(cache_key, data, self.config.cache_ttl_match_ids)
         return data
 
     async def get_match_details(

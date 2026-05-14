@@ -11,9 +11,12 @@ class Config:
         self.region = os.getenv("REGION", "na1")
         self.regional_routing = self._get_regional_routing(self.region)
         self.cache_db_path = os.getenv("CACHE_DB_PATH", "lol_cache.db")
-        self.cache_ttl_matches = int(os.getenv("CACHE_TTL_MATCHES", 3600))   # 1 hour
+        self.cache_ttl_matches = int(os.getenv("CACHE_TTL_MATCHES", 3600))    # 1 hour
         self.cache_ttl_summoner = int(os.getenv("CACHE_TTL_SUMMONER", 300))  # 5 min
         self.cache_ttl_ranked = int(os.getenv("CACHE_TTL_RANKED", 120))      # 2 min
+        self.cache_ttl_match_ids = int(os.getenv("CACHE_TTL_MATCH_IDS", 300))  # 5 min
+        self.coach_model = os.getenv("COACH_MODEL", "claude-opus-4-7")
+        self.conversation_timeout = int(os.getenv("CONVERSATION_TIMEOUT", 1800))  # 30 min
         self.discord_token = os.getenv("DISCORD_TOKEN", "")
 
         if not self.riot_api_key:

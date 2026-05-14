@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -54,36 +55,22 @@ log.info("Starting LoL Coach Bot...")
 config = Config()
 cache = CacheManager(config.cache_db_path)
 riot = RiotAPIClient(config.riot_api_key, cache, config)
-analyzer = LoLAnalyzer(config.anthropic_api_key)
-anthropic_client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+analyzer = LoLAnalyzer(config.anthropic_api_key, config.coach_model)
 log.info("Components initialised (region=%s, routing=%s)", config.region, config.regional_routing)
 
 # ---------------------------------------------------------------------------
 # Per-user Riot ID storage (persisted in the same SQLite DB)
 # ---------------------------------------------------------------------------
 
-cache._conn.execute("""
-    CREATE TABLE IF NOT EXISTS user_profiles (
-        discord_id TEXT PRIMARY KEY,
-        riot_id TEXT NOT NULL
-    )
-""")
-cache._conn.commit()
+cache.ensure_user_profiles_table()
 
 
 def save_riot_id(discord_id: str, riot_id: str):
-    cache._conn.execute(
-        "INSERT OR REPLACE INTO user_profiles (discord_id, riot_id) VALUES (?, ?)",
-        (discord_id, riot_id),
-    )
-    cache._conn.commit()
+    cache.save_user_profile(discord_id, riot_id)
 
 
 def load_riot_id(discord_id: str) -> str | None:
-    row = cache._conn.execute(
-        "SELECT riot_id FROM user_profiles WHERE discord_id = ?", (discord_id,)
-    ).fetchone()
-    return row[0] if row else None
+    return cache.load_user_profile(discord_id)
 
 
 def resolve_riot_id(discord_id: str, provided: str | None) -> str | None:
@@ -95,7 +82,8 @@ def resolve_riot_id(discord_id: str, provided: str | None) -> str | None:
 # Per-user conversation history (in-memory, keyed by channel+user)
 # ---------------------------------------------------------------------------
 
-CONVERSATION_TIMEOUT = 30 * 60  # 30 minutes of inactivity clears history
+CONVERSATION_TIMEOUT = config.conversation_timeout
+MAX_HISTORY_MESSAGES = 20
 _histories: dict[tuple[int, int], dict] = {}
 
 
@@ -107,9 +95,15 @@ def get_history(channel_id: int, user_id: int) -> list:
 
 
 def save_history(channel_id: int, user_id: int, messages: list):
+    now = time.time()
+    # Prune stale entries to prevent unbounded memory growth
+    stale = [k for k, v in _histories.items() if now - v["last_active"] > CONVERSATION_TIMEOUT * 2]
+    for k in stale:
+        del _histories[k]
+    # Cap stored messages to prevent context overflow on next turn
     _histories[(channel_id, user_id)] = {
-        "messages": messages,
-        "last_active": time.time(),
+        "messages": messages[-MAX_HISTORY_MESSAGES:],
+        "last_active": now,
     }
 
 
@@ -198,7 +192,7 @@ async def execute_tool(name: str, args: dict) -> str:
                 args["riot_id"], args.get("count", 10), include_details=True
             )
             ranked = await riot.get_ranked_stats(args["riot_id"])
-            r = await asyncio.get_event_loop().run_in_executor(
+            r = await asyncio.get_running_loop().run_in_executor(
                 None,
                 analyzer.analyze_performance,
                 args["riot_id"],
@@ -228,15 +222,18 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-def coach_system(riot_id: str | None) -> str:
-    base = (
-        "You are an expert League of Legends coach. "
-        "Use the available tools to fetch real player data and give specific, "
-        "data-backed coaching advice. Always reference actual numbers."
-    )
+COACH_SYSTEM = (
+    "You are an expert League of Legends coach. "
+    "Use the available tools to fetch real player data and give specific, "
+    "data-backed coaching advice. Always reference actual numbers."
+)
+
+
+def coach_first_message(riot_id: str | None, query: str) -> str:
+    """Prepend the user's saved Riot ID to their first message so it stays out of the system prompt."""
     if riot_id:
-        base += f" The user's Riot ID is {riot_id} — use it automatically when fetching data unless they ask about someone else."
-    return base
+        return f"[My Riot ID is {riot_id}]\n\n{query}"
+    return query
 
 
 async def _send_long(ctx, text: str):
@@ -361,34 +358,71 @@ async def help_cmd(ctx):
 @bot.command(name="setid")
 async def setid_cmd(ctx, riot_id: str):
     """Save your Riot ID so you don't have to type it every time."""
-    if "#" not in riot_id:
-        await ctx.send("Please use the format `Name#Tag` (e.g. `!setid Faker#KR1`)")
+    if not re.match(r"^[A-Za-z0-9 _\.]{1,16}#[A-Za-z0-9]{3,5}$", riot_id):
+        await ctx.send("Please use the format `Name#Tag` (e.g. `!setid Faker#KR1`). The tag must be 3-5 alphanumeric characters.")
         return
     save_riot_id(str(ctx.author.id), riot_id)
     log.info("Saved Riot ID for %s: %s", ctx.author, riot_id)
     await ctx.send(f"Got it! I'll remember your Riot ID as **{riot_id}**. You can now use `!coach`, `!stats`, `!match` without specifying it.")
 
 
+_in_flight: set[tuple[int, int]] = set()
+
+
 async def run_coach(ctx, query: str):
     """Core agentic loop — shared by !coach and plain follow-up messages."""
+    session_key = (ctx.channel.id, ctx.author.id)
+    if session_key in _in_flight:
+        await ctx.send("Still thinking about your last question — please wait.")
+        return
+    _in_flight.add(session_key)
+    try:
+        await _run_coach_inner(ctx, query, session_key)
+    finally:
+        _in_flight.discard(session_key)
+
+
+async def _run_coach_inner(ctx, query: str, session_key: tuple[int, int]):
     riot_id = load_riot_id(str(ctx.author.id))
     log.info("Coach query from %s (riot_id=%s): %s", ctx.author, riot_id, query)
 
     messages = get_history(ctx.channel.id, ctx.author.id)
-    messages.append({"role": "user", "content": query})
+    # Inject Riot ID into the first user message (not system prompt) to prevent prompt injection
+    first_message = coach_first_message(riot_id, query) if not messages else query
+    messages.append({"role": "user", "content": first_message})
 
+    loop = asyncio.get_running_loop()
     for iteration in range(10):
         log.debug("Claude iteration %d", iteration + 1)
-        response = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: anthropic_client.messages.create(
-                model="claude-opus-4-7",
-                max_tokens=4096,
-                system=coach_system(riot_id),
-                tools=TOOLS,
-                messages=messages,
-            ),
-        )
+        msgs_snapshot = list(messages)
+        try:
+            response = await loop.run_in_executor(
+                None,
+                lambda: analyzer.client.messages.create(
+                    model=config.coach_model,
+                    max_tokens=4096,
+                    system=COACH_SYSTEM,
+                    tools=TOOLS,
+                    messages=msgs_snapshot,
+                ),
+            )
+        except anthropic.BadRequestError as exc:
+            if "context_length_exceeded" in str(exc) or "prompt is too long" in str(exc).lower():
+                log.warning("Context overflow for %s — clearing history and retrying", ctx.author)
+                messages = [{"role": "user", "content": first_message}]
+                msgs_snapshot = list(messages)
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: analyzer.client.messages.create(
+                        model=config.coach_model,
+                        max_tokens=4096,
+                        system=COACH_SYSTEM,
+                        tools=TOOLS,
+                        messages=msgs_snapshot,
+                    ),
+                )
+            else:
+                raise
         log.debug("Claude stop_reason=%s", response.stop_reason)
 
         if response.stop_reason == "end_turn":
@@ -500,7 +534,7 @@ async def match_cmd(ctx, riot_id: str = None):
             return
         log.debug("Fetching match details for %s", match_ids[0])
         match_data = await riot.get_match_details(match_ids[0], riot_id)
-        analysis = await asyncio.get_event_loop().run_in_executor(
+        analysis = await asyncio.get_running_loop().run_in_executor(
             None, analyzer.analyze_match, riot_id, match_data
         )
         await _send_long(ctx, f"**Match analysis for {riot_id}**\n\n{analysis}")

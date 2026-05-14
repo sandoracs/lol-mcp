@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import asyncio.events
 
 import mcp.server.stdio
 import mcp.types as types
@@ -21,7 +20,7 @@ from analyzer import LoLAnalyzer
 config = Config()
 cache = CacheManager(config.cache_db_path)
 riot = RiotAPIClient(config.riot_api_key, cache, config)
-analyzer = LoLAnalyzer(config.anthropic_api_key)
+analyzer = LoLAnalyzer(config.anthropic_api_key, config.coach_model)
 
 app = Server("lol-mcp")
 
@@ -233,7 +232,12 @@ async def _dispatch(name: str, args: dict):
         )
 
     if name == "get_match_details":
-        return await riot.get_match_details(args["match_id"], args.get("riot_id"))
+        riot_id = args.get("riot_id")
+        puuid = None
+        if riot_id:
+            account = await riot.get_account_by_riot_id(riot_id)
+            puuid = account["puuid"]
+        return await riot.get_match_details(args["match_id"], riot_id, puuid)
 
     if name == "get_champion_stats":
         return await riot.get_champion_stats(
@@ -246,7 +250,7 @@ async def _dispatch(name: str, args: dict):
         count = args.get("count", 10)
         matches = await riot.get_match_history(args["riot_id"], count, include_details=True)
         ranked = await riot.get_ranked_stats(args["riot_id"])
-        return await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             None,
             analyzer.analyze_performance,
             args["riot_id"],
@@ -257,7 +261,7 @@ async def _dispatch(name: str, args: dict):
 
     if name == "analyze_match":
         match_data = await riot.get_match_details(args["match_id"], args["riot_id"])
-        return await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             None,
             analyzer.analyze_match,
             args["riot_id"],
@@ -268,7 +272,7 @@ async def _dispatch(name: str, args: dict):
         champion_stats = await riot.get_champion_stats(
             args["riot_id"], count=args.get("count", 30)
         )
-        return await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             None,
             analyzer.analyze_champion,
             args["riot_id"],
@@ -276,7 +280,7 @@ async def _dispatch(name: str, args: dict):
         )
 
     if name == "get_pre_game_tips":
-        return await asyncio.get_event_loop().run_in_executor(
+        return await asyncio.get_running_loop().run_in_executor(
             None,
             analyzer.get_pre_game_tips,
             args["riot_id"],
