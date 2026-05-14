@@ -70,9 +70,9 @@ class RiotAPIClient:
             "game_name": account["gameName"],
             "tag_line": account["tagLine"],
             "puuid": account["puuid"],
-            "summoner_id": summoner["id"],
-            "summoner_level": summoner["summonerLevel"],
-            "profile_icon_id": summoner["profileIconId"],
+            "summoner_id": summoner.get("id", ""),
+            "summoner_level": summoner.get("summonerLevel", 0),
+            "profile_icon_id": summoner.get("profileIconId", 0),
         }
 
     # ------------------------------------------------------------------ #
@@ -80,14 +80,19 @@ class RiotAPIClient:
     # ------------------------------------------------------------------ #
 
     async def get_ranked_stats(self, riot_id: str) -> dict:
-        summoner = await self.get_summoner(riot_id)
-        summoner_id = summoner["summoner_id"]
+        account = await self.get_account_by_riot_id(riot_id)
+        puuid = account["puuid"]
+        summoner = await self.get_summoner_by_puuid(puuid)
+        summoner_id = summoner.get("id", "")
 
-        cache_key = f"ranked:{summoner_id}"
+        cache_key = f"ranked:{puuid}"
         if cached := self.cache.get(cache_key):
             return cached
 
-        url = self._platform_url(f"/lol/league/v4/entries/by-summoner/{summoner_id}")
+        if summoner_id:
+            url = self._platform_url(f"/lol/league/v4/entries/by-summoner/{summoner_id}")
+        else:
+            url = self._platform_url(f"/lol/league/v4/entries/by-puuid/{puuid}")
         entries = await self._get(url)
 
         ranked: dict = {}
@@ -107,7 +112,16 @@ class RiotAPIClient:
                 "fresh_blood": entry.get("freshBlood", False),
             }
 
-        result = {"summoner": summoner, "ranked": ranked}
+        summoner_data = {
+            "riot_id": riot_id,
+            "game_name": account["gameName"],
+            "tag_line": account["tagLine"],
+            "puuid": puuid,
+            "summoner_id": summoner_id,
+            "summoner_level": summoner.get("summonerLevel", 0),
+            "profile_icon_id": summoner.get("profileIconId", 0),
+        }
+        result = {"summoner": summoner_data, "ranked": ranked}
         self.cache.set(cache_key, result, self.config.cache_ttl_ranked)
         return result
 
@@ -136,38 +150,37 @@ class RiotAPIClient:
         return data
 
     async def get_match_details(
-        self, match_id: str, riot_id: Optional[str] = None
+        self, match_id: str, riot_id: Optional[str] = None, puuid: Optional[str] = None
     ) -> dict:
         cache_key = f"match:{match_id}"
         if cached := self.cache.get(cache_key):
-            return self._summarise_for_player(cached, riot_id) if riot_id else cached
+            return self._summarise_for_player(cached, riot_id, puuid) if riot_id else cached
 
         url = self._regional_url(f"/lol/match/v5/matches/{match_id}")
         data = await self._get(url)
         self.cache.set(cache_key, data, self.config.cache_ttl_matches)
 
-        return self._summarise_for_player(data, riot_id) if riot_id else data
+        return self._summarise_for_player(data, riot_id, puuid) if riot_id else data
 
-    def _summarise_for_player(self, match_data: dict, riot_id: str) -> dict:
-        game_name = riot_id.split("#")[0].lower() if "#" in riot_id else riot_id.lower()
+    def _summarise_for_player(self, match_data: dict, riot_id: str, puuid: Optional[str] = None) -> dict:
         info = match_data.get("info", {})
         participants = info.get("participants", [])
 
-        target = next(
-            (
-                p for p in participants
-                if p.get("riotIdGameName", "").lower() == game_name
-            ),
-            None,
-        )
+        target = None
+        if puuid:
+            target = next((p for p in participants if p.get("puuid") == puuid), None)
+
         if not target:
+            game_name = riot_id.split("#")[0].lower() if "#" in riot_id else riot_id.lower()
             target = next(
-                (
-                    p for p in participants
-                    if game_name in p.get("riotIdGameName", "").lower()
-                ),
+                (p for p in participants if p.get("riotIdGameName", "").lower() == game_name),
                 None,
             )
+            if not target:
+                target = next(
+                    (p for p in participants if game_name in p.get("riotIdGameName", "").lower()),
+                    None,
+                )
         if not target:
             return {"error": f"Player '{riot_id}' not found in match", "match_id": match_data.get("metadata", {}).get("matchId", "")}
 
@@ -250,7 +263,7 @@ class RiotAPIClient:
         matches = []
         for mid in match_ids:
             try:
-                matches.append(await self.get_match_details(mid, riot_id))
+                matches.append(await self.get_match_details(mid, riot_id, puuid))
             except Exception:
                 continue
 
@@ -278,7 +291,7 @@ class RiotAPIClient:
 
         for mid in match_ids:
             try:
-                m = await self.get_match_details(mid, riot_id)
+                m = await self.get_match_details(mid, riot_id, puuid)
                 champ = m.get("champion", "Unknown")
                 if champion_name and champ.lower() != champion_name.lower():
                     continue
