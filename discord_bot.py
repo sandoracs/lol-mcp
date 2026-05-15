@@ -378,8 +378,39 @@ async def run_coach(ctx, query: str):
     _in_flight.add(session_key)
     try:
         await _run_coach_inner(ctx, query, session_key)
+    except Exception as exc:
+        log.error("Coach error for %s: %s", ctx.author, exc, exc_info=VERBOSE)
+        await ctx.send("Something went wrong — please try again in a moment.")
     finally:
         _in_flight.discard(session_key)
+
+
+async def _call_claude(loop, msgs_snapshot: list) -> object:
+    """Call Claude with retry logic for transient API errors (overloaded / rate limit)."""
+    delays = [5, 15, 30]
+    for attempt, delay in enumerate(delays):
+        try:
+            return await loop.run_in_executor(
+                None,
+                lambda: analyzer.client.messages.create(
+                    model=config.coach_model,
+                    max_tokens=4096,
+                    system=COACH_SYSTEM,
+                    tools=TOOLS,
+                    messages=msgs_snapshot,
+                ),
+            )
+        except anthropic.APIStatusError as exc:
+            # 529 = overloaded, 529/529 are transient — retry with backoff
+            if exc.status_code in (429, 529) and attempt < len(delays) - 1:
+                log.warning(
+                    "Claude API %s (attempt %d/%d) — retrying in %ds",
+                    exc.status_code, attempt + 1, len(delays), delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 async def _run_coach_inner(ctx, query: str, session_key: tuple[int, int]):
@@ -396,31 +427,12 @@ async def _run_coach_inner(ctx, query: str, session_key: tuple[int, int]):
         log.debug("Claude iteration %d", iteration + 1)
         msgs_snapshot = list(messages)
         try:
-            response = await loop.run_in_executor(
-                None,
-                lambda: analyzer.client.messages.create(
-                    model=config.coach_model,
-                    max_tokens=4096,
-                    system=COACH_SYSTEM,
-                    tools=TOOLS,
-                    messages=msgs_snapshot,
-                ),
-            )
+            response = await _call_claude(loop, msgs_snapshot)
         except anthropic.BadRequestError as exc:
             if "context_length_exceeded" in str(exc) or "prompt is too long" in str(exc).lower():
                 log.warning("Context overflow for %s — clearing history and retrying", ctx.author)
                 messages = [{"role": "user", "content": first_message}]
-                msgs_snapshot = list(messages)
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: analyzer.client.messages.create(
-                        model=config.coach_model,
-                        max_tokens=4096,
-                        system=COACH_SYSTEM,
-                        tools=TOOLS,
-                        messages=msgs_snapshot,
-                    ),
-                )
+                response = await _call_claude(loop, list(messages))
             else:
                 raise
         log.debug("Claude stop_reason=%s", response.stop_reason)
